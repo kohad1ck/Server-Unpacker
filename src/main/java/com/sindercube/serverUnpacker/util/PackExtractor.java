@@ -38,10 +38,8 @@ public class PackExtractor {
 				ZipEntry entry = entries.nextElement();
 				String rawEntryName = entry.getName();
 
-				// 规范化 name：去掉前导 "./", 前导 "/"，合并重复分隔符
-				String entryName = rawEntryName.replaceAll("^\\./+", "")
-						.replaceAll("^/+", "")
-						.replaceAll("/{2,}", "/");
+				// 规范化 name：去掉前导 "./", 前导 "/"，合并重复分隔符，并移除末尾的 '/'
+				String entryName = normalizeEntryName(rawEntryName);
 
 				if (entryName == null || entryName.isEmpty()) {
 					continue;
@@ -53,9 +51,10 @@ public class PackExtractor {
 						|| rawEntryName.endsWith("\\");
 
 				// 如果不是显式目录，则检查是否存在以该条目为前缀的其它条目（说明它应当是目录）
-				// 但为了避免把像 pack.mcmeta / pack.png 这种带扩展名的文件误判为目录，只有在最后组件没有文件扩展名时才把它视为目录
+				// 但为了避免把像 pack.mcmeta / pack.png 这种带扩展名的文件误判为目录，
+				// 只有在最后组件没有文件扩展名时才把它视为目录。
 				if (!entryIsDirectory) {
-					if (!hasFileExtension(entryName) && zipContainsDirPrefix(zip, entryName)) {
+					if (zipContainsDirPrefix(zip, entryName) && !hasFileExtension(entryName)) {
 						entryIsDirectory = true;
 					}
 				}
@@ -123,11 +122,25 @@ public class PackExtractor {
 	// 判断最后一部分是否看起来像有文件扩展名（简单检查 '.' 且非以 '.' 开头）
 	private boolean hasFileExtension(String entryName) {
 		if (entryName == null || entryName.isEmpty()) return false;
-		int idx = entryName.lastIndexOf('/');
-		String last = idx >= 0 ? entryName.substring(idx + 1) : entryName;
-		// 如果最后部分以 '.' 开头（例如 ".gitignore"），也视为有扩展名（更可靠）
+		// 去掉可能的尾部分隔符
+		String n = entryName;
+		while (n.endsWith("/") || n.endsWith("\\")) n = n.substring(0, n.length() - 1);
+		int idx = n.lastIndexOf('/');
+		String last = idx >= 0 ? n.substring(idx + 1) : n;
 		int dot = last.lastIndexOf('.');
 		return dot > 0 && dot < last.length() - 1;
+	}
+
+	/**
+	 * 规范化 zip 条目名以便比较：删除前导 "./" 和前导 "/", 合并重复分隔符并移除末尾的 '/'
+	 */
+	private String normalizeEntryName(String entryName) {
+		if (entryName == null) return null;
+		String n = entryName.replaceAll("^\\./+", "")
+				.replaceAll("^/+", "")
+				.replaceAll("/{2,}", "/");
+		while (n.endsWith("/")) n = n.substring(0, n.length() - 1);
+		return n;
 	}
 
 	/**
@@ -288,11 +301,15 @@ public class PackExtractor {
 
 	private boolean zipContainsDirPrefix(ZipFile zip, String name) {
 		try {
-			String prefix = name.endsWith("/") ? name : name + "/";
+			if (name == null) return false;
+			String normName = normalizeEntryName(name);
+			String prefix = normName.isEmpty() ? "" : (normName + "/");
 			Enumeration<? extends ZipEntry> en = zip.entries();
 			while (en.hasMoreElements()) {
 				String n = en.nextElement().getName();
-				if (n.startsWith(prefix)) return true;
+				String nn = normalizeEntryName(n);
+				// 要求 nn 是以 prefix 开头且不是完全相同（即为子项），避免把同名文件误判
+				if (nn.startsWith(prefix) && !nn.equals(normName)) return true;
 			}
 		} catch (Exception ignored) {
 		}
