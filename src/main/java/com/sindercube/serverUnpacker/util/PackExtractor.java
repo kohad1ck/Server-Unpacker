@@ -173,10 +173,10 @@ public class PackExtractor {
 	}
 
 	/**
-	 * 更激进的缩短流程（仅用于“文件”路径）：
-	 * 1) 移除所有非最后组件的单字母目录
-	 * 2) 逐步截断组件（保留文件扩展）
-	 * 3) 使用中间哈希（保留首尾）替换中间组件
+	 * 更温和的缩短流程（仅用于“文件”路径）：
+	 * - 尽量不移除导致路径深度降为 1 的单字母目录；
+	 * - 截断时保留更多字符（非末尾至少保留 2，末尾文件名主体至少保留 3）；
+	 * - 尝试从较温和的截断长度开始（16 -> 4），仅在需要时使用哈希替换中间部分；
 	 */
 	private String shortenPathMoreAggressively(String entryName, Path destRootPath, int maxLen) {
 		try {
@@ -194,29 +194,39 @@ public class PackExtractor {
 				return single == null ? null : single;
 			}
 
-			// 1) 移除所有单字母目录（不包含最后一部分）
+			// 目标：缩短后至少保留的组件数（如果原始有多于1个组件，至少保留 2 个）
+			int minComponents = Math.min(2, n);
+
+			// 1) 尝试移除单字母目录（不包含最后一部分），但不要把深度降到 1
 			List<String> partsNoSingles = new ArrayList<>();
 			for (int i = 0; i < n; i++) {
 				String p = parts.get(i);
 				if (i != n - 1 && p.length() == 1) continue;
 				partsNoSingles.add(p);
 			}
-			String candidate1 = String.join("/", partsNoSingles);
-			Path p1 = destRootPath.resolve(candidate1.replace('/', File.separatorChar)).normalize().toAbsolutePath();
-			if (p1.toString().length() <= maxLen) {
-				System.err.println("Removed single-letter dirs: " + entryName + " -> " + candidate1);
-				return candidate1;
+			// 如果移除导致深度小于要求，则放弃移除单字母目录（减少过激行为）
+			if (partsNoSingles.size() < minComponents) {
+				partsNoSingles = new ArrayList<>(parts); // revert to original parts (不移除)
+			} else {
+				String candidate1 = String.join("/", partsNoSingles);
+				Path p1 = destRootPath.resolve(candidate1.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+				if (p1.toString().length() <= maxLen) {
+					System.err.println("Removed single-letter dirs (conservative): " + entryName + " -> " + candidate1);
+					return candidate1;
+				}
 			}
 
-			// 2) 逐步截断每个组件（从 8 到 1）
-			for (int compLen = 8; compLen >= 1; compLen--) {
+			// 2) 逐步截断每个组件（从较大长度到较小，尝试更温和的截断）
+			for (int compLen = 16; compLen >= 4; compLen--) {
 				List<String> truncated = new ArrayList<>();
 				for (int i = 0; i < partsNoSingles.size(); i++) {
 					String comp = partsNoSingles.get(i);
 					if (i == partsNoSingles.size() - 1) {
-						truncated.add(truncateFilename(comp, destRootPath, maxLen, compLen));
+						// 末尾（文件名主体）至少保留 3 个字符（如果可能）
+						truncated.add(truncateFilename(comp, destRootPath, maxLen, Math.max(3, compLen)));
 					} else {
-						truncated.add(truncateComponent(comp, compLen));
+						// 非末尾组件至少保留 2 个字符
+						truncated.add(truncateComponent(comp, Math.max(2, compLen)));
 					}
 				}
 				boolean anyNull = false;
@@ -225,14 +235,18 @@ public class PackExtractor {
 				}
 				if (anyNull) continue;
 				String candidate = String.join("/", truncated);
+				// 若截断后组件数少于要求（例如被截成单组件），则跳过该候选
+				int compCount = candidate.isEmpty() ? 0 : candidate.split("/").length;
+				if (compCount < minComponents) continue;
+
 				Path cp = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
 				if (cp.toString().length() <= maxLen) {
-					System.err.println("Truncated components to avoid long path: " + entryName + " -> " + candidate);
+					System.err.println("Truncated components to avoid long path (conservative): " + entryName + " -> " + candidate);
 					return candidate;
 				}
 			}
 
-			// 3) 使用中间哈希
+			// 3) 使用中间哈希，但保留首/尾的最少字符（首保留至少2，尾保留至少3）
 			if (partsNoSingles.size() >= 2) {
 				String first = partsNoSingles.get(0);
 				String last = partsNoSingles.get(partsNoSingles.size() - 1);
@@ -247,18 +261,24 @@ public class PackExtractor {
 				}
 				String hash = hashToHex(middleJoined);
 				String candidate = first + "/" + hash + "/" + last;
-				Path cp = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
-				if (cp.toString().length() <= maxLen) {
-					System.err.println("Replaced middle with hash to avoid long path: " + entryName + " -> " + candidate);
-					return candidate;
+				// 检查组件数
+				int compCount = 3; // first/hash/last
+				if (compCount >= minComponents) {
+					Path cp = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+					if (cp.toString().length() <= maxLen) {
+						System.err.println("Replaced middle with hash to avoid long path: " + entryName + " -> " + candidate);
+						return candidate;
+					}
 				}
-				String firstShort = truncateComponent(first, 4);
-				String lastShort = truncateFilename(last, destRootPath, maxLen, 4);
-				if (firstShort != null && lastShort != null) {
-					String candidate2 = firstShort + "/" + hash + "/" + lastShort;
+				// 尝试压短首尾（但保留最低长度）
+				String firstShort = truncateComponent(first, 4); // 最少 2 => truncateComponent 会保证
+				String lastShort = truncateFilename(last, destRootPath, maxLen, 4); // 最少 3 保留
+				String candidate2 = firstShort + "/" + hash + "/" + lastShort;
+				int compCount2 = candidate2.isEmpty() ? 0 : candidate2.split("/").length;
+				if (compCount2 >= minComponents) {
 					Path cp2 = destRootPath.resolve(candidate2.replace('/', File.separatorChar)).normalize().toAbsolutePath();
 					if (cp2.toString().length() <= maxLen) {
-						System.err.println("Replaced middle with hash and truncated ends: " + entryName + " -> " + candidate2);
+						System.err.println("Replaced middle with hash and truncated ends (conservative): " + entryName + " -> " + candidate2);
 						return candidate2;
 					}
 				}
@@ -273,7 +293,9 @@ public class PackExtractor {
 	private String truncateComponent(String comp, int len) {
 		if (comp == null) return comp;
 		if (comp.length() <= len) return comp;
-		return comp.substring(0, Math.max(1, len));
+		// 改为至少保留 2 个字符，避免单字符目录
+		int actual = Math.max(2, Math.min(len, comp.length()));
+		return comp.substring(0, actual);
 	}
 
 	private String truncateFilename(String filename, Path destRootPath, int maxLen, Integer compLen) {
@@ -283,8 +305,10 @@ public class PackExtractor {
 		String extPart = idx >= 0 ? filename.substring(idx) : "";
 
 		if (compLen != null && compLen > 0) {
-			if (namePart.length() > compLen) {
-				namePart = namePart.substring(0, Math.max(1, compLen));
+			// 对末尾文件主体，至少保留 3 个字符（当可能时）
+			int actual = Math.max(3, Math.min(compLen, Math.max(1, namePart.length())));
+			if (namePart.length() > actual) {
+				namePart = namePart.substring(0, actual);
 			}
 		}
 
