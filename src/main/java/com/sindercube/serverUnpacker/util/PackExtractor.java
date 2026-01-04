@@ -55,17 +55,35 @@ public class PackExtractor {
 				ZipEntry entry = entries.nextElement();
 
 				// 原始 zip 内路径（zip 里统一使用 '/' 分隔）
-				String entryName = entry.getName();
+				String rawEntryName = entry.getName();
+
+				// 处理并规范化 entryName：去掉前导 "./"，合并重复斜杠，去掉前导斜杠
+				String entryName = rawEntryName.replaceAll("^\\./+", "")
+						.replaceAll("^/+", "")
+						.replaceAll("/{2,}", "/");
+
+				// 跳过空条目（例如 zip 中可能存在空名称）
+				if (entryName == null || entryName.isEmpty()) {
+					continue;
+				}
+
+				// 判断是否为目录：entry 本身标记为目录 或 名称以 '/' 结尾，或者 zip 中存在以该名称为前缀的其它条目（说明它实际是个目录）
+				boolean entryIsDirectory = entry.isDirectory() || rawEntryName.endsWith("/") || rawEntryName.endsWith("\\");
+
+				// 如果 zip 中没有显式目录标记，但存在以 "name/" 为前缀的其它 entry，则把当前条目当作目录（避免把 assets 写成文件）
+				if (!entryIsDirectory && zipContainsDirPrefix(zip, entryName)) {
+					entryIsDirectory = true;
+				}
 
 				// 如果是目录，则使用规范化的 Path 来创建目录并继续（避免提前 canonical）
-				if (entry.isDirectory()) {
-					// 将 zip 内的 '/' 转换为系统分隔符再 resolve
+				if (entryIsDirectory) {
 					Path dirPath = destRootPath.resolve(entryName.replace('/', File.separatorChar)).normalize();
 					File dir = dirPath.toFile();
 					if (!dir.exists() && !dir.mkdirs()) {
 						throw new IOException("Failed to create directory: " + dir);
 					}
-					// 目录条目视为处理完成（如需也调用 onItemFinished 可修改）
+					// 目录条目视为处理完成
+					onItemFinished.run();
 					continue;
 				}
 
@@ -73,24 +91,25 @@ public class PackExtractor {
 				String adjustedEntryName = entryName;
 
 				// 先用语法上的 resolve/normalize 构造 candidate（不访问文件系统）
-				Path candidateResolved = destRootPath.resolve(adjustedEntryName.replace('/', File.separatorChar)).normalize();
+				Path candidateResolved = destRootPath.resolve(adjustedEntryName.replace('/', File.separatorChar)).normalize().toAbsolutePath();
 				String candidateResolvedStr = candidateResolved.toString();
 
 				// 如果语法化后的路径字符串长度超过限制，尝试用算法缩短 entryName
 				if (candidateResolvedStr.length() > MAX_PATH_LENGTH) {
 					// 调整算法现在接受 destRootPath 并基于 resolve/normalize 来判断长度（不调用 canonical）
-					adjustedEntryName = tryShortenByRemovingSingleLetterDirs(entryName, destRootPath, MAX_PATH_LENGTH);
-					if (adjustedEntryName == null) {
+					String shortened = tryShortenByRemovingSingleLetterDirs(adjustedEntryName, destRootPath, MAX_PATH_LENGTH);
+					if (shortened == null) {
 						System.err.println("Skipped entry due to excessive path length and cannot shorten: " + entryName);
 						continue;
 					}
-					candidateResolved = destRootPath.resolve(adjustedEntryName.replace('/', File.separatorChar)).normalize();
+					adjustedEntryName = shortened;
+					candidateResolved = destRootPath.resolve(adjustedEntryName.replace('/', File.separatorChar)).normalize().toAbsolutePath();
 					candidateResolvedStr = candidateResolved.toString();
 				}
 
 				// Zip Slip 检查：确保 candidateResolved 在 destRootPath 之下（或等于 destRootPath）
 				// 使用 Path.startsWith 比较规范化后的绝对路径以避免穿越
-				if (!candidateResolved.startsWith(destRootPath) && !candidateResolved.equals(destRootPath)) {
+				if (!candidateResolved.startsWith(destRootPath)) {
 					System.err.println("Skipped entry due to zip-slip attempt: " + entryName + " -> " + adjustedEntryName);
 					continue;
 				}
@@ -123,19 +142,40 @@ public class PackExtractor {
 	}
 
 	/**
+	 * 判断 zip 中是否存在以 name + '/' 为前缀的条目（表明 name 实际上是一个目录）
+	 */
+	private boolean zipContainsDirPrefix(ZipFile zip, String name) {
+		try {
+			String prefix = name.endsWith("/") ? name : name + "/";
+			Enumeration<? extends ZipEntry> en = zip.entries();
+			while (en.hasMoreElements()) {
+				String n = en.nextElement().getName();
+				if (n.startsWith(prefix)) return true;
+			}
+		} catch (Exception ignored) {
+		}
+		return false;
+	}
+
+	/**
 	 * 尝试通过移除 entryName 中的单字母目录（不移除最后一个组件，即文件名）来缩短路径，使得在 destRootPath 下的规范化路径长度不超过 maxLen。
 	 * 如果无法通过移除单字母目录达成，则返回 null（表示无法缩短）。
 	 *
-	 * 算法策略（与原实现相似，但长度检查改为基于 Path.resolve(...).normalize().toAbsolutePath().toString()）：
-	 * - 将 entryName 按 '/' 分割为组件。
+	 * 算法策略（更健壮的实现）：
+	 * - 将 entryName 按 '/' 分割为组件，忽略空组件。
 	 * - 收集索引为单字母的组件（不包含最后一部分）。
-	 * - 按从左到右顺序依次移除这些单字母组件（依次尝试移除一个或多个），每移除一次就构建 candidate 并检查长度是否达标。
-	 * - 如果仍失败，尝试从右向左移除一段单字母目录（保留靠近根或靠近文件端的不同组合）。
+	 * - 按 removableIndices 的不同组合依次移除，优先尝试从左到右移除较少数量的组件，再尝试从右向左移除一段。
 	 */
 	private String tryShortenByRemovingSingleLetterDirs(String entryName, Path destRootPath, int maxLen) {
 		try {
-			String[] parts = entryName.split("/"); // Zip entry uses '/'
-			int n = parts.length;
+			// 分割并忽略空部分
+			String[] rawParts = entryName.split("/");
+			List<String> partsList = new ArrayList<>();
+			for (String p : rawParts) {
+				if (p == null || p.isEmpty()) continue;
+				partsList.add(p);
+			}
+			int n = partsList.size();
 			if (n == 0) return null;
 
 			// 如果只有一个部分（文件名），无法缩短
@@ -146,7 +186,7 @@ public class PackExtractor {
 			// 收集可移除的单字母部分索引（不包含最后一部分）
 			List<Integer> removableIndices = new ArrayList<>();
 			for (int i = 0; i < n - 1; i++) {
-				if (parts[i].length() == 1) {
+				if (partsList.get(i).length() == 1) {
 					removableIndices.add(i);
 				}
 			}
@@ -156,17 +196,15 @@ public class PackExtractor {
 			}
 
 			// 如果当前 destRoot + original entry 已经不超过 maxLen（防御性检查）
-			Path origCandidate = destRootPath.resolve(entryName.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+			Path origCandidate = destRootPath.resolve(String.join(File.separator, partsList)).normalize().toAbsolutePath();
 			if (origCandidate.toString().length() <= maxLen) {
 				return entryName;
 			}
 
 			// 按 removableIndices 的顺序逐步移除 1..k 个单字母目录，检查是否达标
-			boolean[] removed = new boolean[n];
-			for (int idx : removableIndices) removed[idx] = false;
-
-			for (int r = 1; r <= removableIndices.size(); r++) {
-				// 每一轮移除 r 个单字母目录（按 removableIndices 顺序）
+			int m = removableIndices.size();
+			for (int r = 1; r <= m; r++) {
+				boolean[] removed = new boolean[n];
 				for (int i = 0; i < r; i++) {
 					removed[removableIndices.get(i)] = true;
 				}
@@ -175,7 +213,7 @@ public class PackExtractor {
 				for (int i = 0; i < n; i++) {
 					if (removed[i]) continue;
 					if (sb.length() > 0) sb.append('/');
-					sb.append(parts[i]);
+					sb.append(partsList.get(i));
 				}
 				String candidate = sb.toString();
 				Path candidatePath = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
@@ -186,16 +224,16 @@ public class PackExtractor {
 			}
 
 			// 再尝试从右向左移除一段单字母目录（例如移除靠近文件端的若干单字母目录）
-			for (int start = removableIndices.size() - 1; start >= 0; start--) {
+			for (int start = m - 1; start >= 0; start--) {
 				boolean[] removed2 = new boolean[n];
-				for (int i = start; i < removableIndices.size(); i++) {
+				for (int i = start; i < m; i++) {
 					removed2[removableIndices.get(i)] = true;
 				}
 				StringBuilder sb = new StringBuilder();
 				for (int i = 0; i < n; i++) {
 					if (removed2[i]) continue;
 					if (sb.length() > 0) sb.append('/');
-					sb.append(parts[i]);
+					sb.append(partsList.get(i));
 				}
 				String candidate = sb.toString();
 				Path candidatePath = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
