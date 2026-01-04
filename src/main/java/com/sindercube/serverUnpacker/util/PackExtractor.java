@@ -50,17 +50,12 @@ public class PackExtractor {
 						|| rawEntryName.endsWith("/")
 						|| rawEntryName.endsWith("\\");
 
-				// 如果被显式标记为目录，但 ZIP 中存在同名的显式文件条目，我们应优先把它当作文件处理（避免把 pack.mcmeta/ 导出为目录）
-				if (entryIsDirectory) {
-					if (hasFileExtension(entryName) && zipHasExplicitFile(zip, entryName)) {
-						// 优先当作文件
-						entryIsDirectory = false;
-					}
-				}
+				// 不再把显式目录与显式文件冲突时优先处理文件，改为优先保留目录并忽略同名文件。
+				// 因此这里不做任何“优先文件”的转换。
 
 				// 如果不是显式目录，则检查是否存在以该条目为前缀的其它条目（说明它应当是目录）
 				// 但为了避免把像 pack.mcmeta / pack.png 这种带扩展名的文件误判为目录，
-				// 只有在最后组件没有文件扩展名时才把它视为目录。
+				// 只有在最后组件没有文件扩展名时才把它视为目录（同时仍然可以通过显式目录判断）。
 				if (!entryIsDirectory) {
 					if (zipContainsDirPrefix(zip, entryName) && !hasFileExtension(entryName)) {
 						entryIsDirectory = true;
@@ -78,6 +73,14 @@ public class PackExtractor {
 				}
 
 				// --- 此时确定是文件（file） ---
+				// 重要：如果 ZIP 中存在与该文件同名的目录（显式目录条目或存在子项），
+				// 则优先导出目录并忽略该文件（用户要求）
+				if (zipHasExplicitDir(zip, entryName) || zipContainsDirPrefix(zip, entryName)) {
+					System.err.println("Ignored file because a directory with the same name exists in ZIP: " + entryName);
+					onItemFinished.run();
+					continue;
+				}
+
 				// 对 entryName 做安全清理（但不要在这里移除单字母目录以免改变目录检测）
 				String adjustedEntryName = sanitizeEntryName(entryName);
 
@@ -346,6 +349,28 @@ public class PackExtractor {
 				String n = en.nextElement().getName();
 				String nn = normalizeEntryName(n);
 				if (nn.startsWith(prefix) && !nn.equals(normName)) return true;
+			}
+		} catch (Exception ignored) {
+		}
+		return false;
+	}
+
+	/**
+	 * 检查 ZIP 中是否存在与 name 完全匹配的显式目录条目
+	 */
+	private boolean zipHasExplicitDir(ZipFile zip, String name) {
+		try {
+			if (name == null) return false;
+			String normName = normalizeEntryName(name);
+			Enumeration<? extends ZipEntry> en = zip.entries();
+			while (en.hasMoreElements()) {
+				ZipEntry ze = en.nextElement();
+				String nn = normalizeEntryName(ze.getName());
+				if (nn.equals(normName)) {
+					if (ze.isDirectory() || ze.getName().endsWith("/") || ze.getName().endsWith("\\")) {
+						return true;
+					}
+				}
 			}
 		} catch (Exception ignored) {
 		}
