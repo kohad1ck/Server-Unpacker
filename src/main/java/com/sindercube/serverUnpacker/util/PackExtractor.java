@@ -38,7 +38,7 @@ public class PackExtractor {
 				ZipEntry entry = entries.nextElement();
 				String rawEntryName = entry.getName();
 
-				// 规范化 name：去掉前导 "./", 前导 "/"，合并重复分隔符，并移除末尾的 '/'
+				// 规范化 name：统一分隔符为 '/'，去掉前导 "./", 前导 "/"，合并重复分隔符，并移除末尾的 '/'
 				String entryName = normalizeEntryName(rawEntryName);
 
 				if (entryName == null || entryName.isEmpty()) {
@@ -49,6 +49,14 @@ public class PackExtractor {
 				boolean entryIsDirectory = entry.isDirectory()
 						|| rawEntryName.endsWith("/")
 						|| rawEntryName.endsWith("\\");
+
+				// 如果被显式标记为目录，但 ZIP 中存在同名的显式文件条目，我们应优先把它当作文件处理（避免把 pack.mcmeta/ 导出为目录）
+				if (entryIsDirectory) {
+					if (hasFileExtension(entryName) && zipHasExplicitFile(zip, entryName)) {
+						// 优先当作文件
+						entryIsDirectory = false;
+					}
+				}
 
 				// 如果不是显式目录，则检查是否存在以该条目为前缀的其它条目（说明它应当是目录）
 				// 但为了避免把像 pack.mcmeta / pack.png 这种带扩展名的文件误判为目录，
@@ -122,9 +130,8 @@ public class PackExtractor {
 	// 判断最后一部分是否看起来像有文件扩展名（简单检查 '.' 且非以 '.' 开头）
 	private boolean hasFileExtension(String entryName) {
 		if (entryName == null || entryName.isEmpty()) return false;
-		// 去掉可能的尾部分隔符
-		String n = entryName;
-		while (n.endsWith("/") || n.endsWith("\\")) n = n.substring(0, n.length() - 1);
+		String n = entryName.replace('\\', '/');
+		while (n.endsWith("/")) n = n.substring(0, n.length() - 1);
 		int idx = n.lastIndexOf('/');
 		String last = idx >= 0 ? n.substring(idx + 1) : n;
 		int dot = last.lastIndexOf('.');
@@ -132,11 +139,13 @@ public class PackExtractor {
 	}
 
 	/**
-	 * 规范化 zip 条目名以便比较：删除前导 "./" 和前导 "/", 合并重复分隔符并移除末尾的 '/'
+	 * 规范化 zip 条目名以便比较：统一分隔符为 '/'，删除前导 "./" 和前导 "/", 合并重复分隔符并移除末尾的 '/'
 	 */
 	private String normalizeEntryName(String entryName) {
 		if (entryName == null) return null;
-		String n = entryName.replaceAll("^\\./+", "")
+		// 先把反斜杠统一为正斜杠，方便后续比较
+		String n = entryName.replace('\\', '/')
+				.replaceAll("^\\./+", "")
 				.replaceAll("^/+", "")
 				.replaceAll("/{2,}", "/");
 		while (n.endsWith("/")) n = n.substring(0, n.length() - 1);
@@ -299,6 +308,10 @@ public class PackExtractor {
 		}
 	}
 
+	/**
+	 * 检查 ZIP 中是否存在以 name 为前缀的子项（规范化比较）
+	 * 要求找到的条目是严格子项（nn.startsWith(prefix) 且 nn != normName）
+	 */
 	private boolean zipContainsDirPrefix(ZipFile zip, String name) {
 		try {
 			if (name == null) return false;
@@ -308,8 +321,31 @@ public class PackExtractor {
 			while (en.hasMoreElements()) {
 				String n = en.nextElement().getName();
 				String nn = normalizeEntryName(n);
-				// 要求 nn 是以 prefix 开头且不是完全相同（即为子项），避免把同名文件误判
 				if (nn.startsWith(prefix) && !nn.equals(normName)) return true;
+			}
+		} catch (Exception ignored) {
+		}
+		return false;
+	}
+
+	/**
+	 * 检查 ZIP 中是否存在与 name 完全匹配的非目录条目（显式文件）
+	 * 用于在出现显式目录条目时，判断是否也存在文件条目；如果存在文件条目则优先当作文件处理。
+	 */
+	private boolean zipHasExplicitFile(ZipFile zip, String name) {
+		try {
+			if (name == null) return false;
+			String normName = normalizeEntryName(name);
+			Enumeration<? extends ZipEntry> en = zip.entries();
+			while (en.hasMoreElements()) {
+				ZipEntry ze = en.nextElement();
+				String nn = normalizeEntryName(ze.getName());
+				if (nn.equals(normName)) {
+					// 如果这个条目本身不是目录（名称不以 '/' 结尾且 ZipEntry 不是 directory），认为是显式文件
+					if (!ze.isDirectory() && !ze.getName().endsWith("/") && !ze.getName().endsWith("\\")) {
+						return true;
+					}
+				}
 			}
 		} catch (Exception ignored) {
 		}
