@@ -2,8 +2,10 @@ package com.sindercube.serverUnpacker.util;
 
 import java.io.*;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.Formatter;
 import java.util.List;
 import java.util.function.LongConsumer;
 import java.util.zip.ZipEntry;
@@ -12,7 +14,7 @@ import java.util.zip.ZipFile;
 /**
  * PackExtractor：安全的 zip 解压工具，包含：
  * - 防止 Zip Slip（路径穿越）
- * - 在路径超长时尝试通过移除单字母目录缩短路径
+ * - 在路径超长时尽可能缩短路径（移除单字母目录、截断组件、使用中间哈希）
  * - 避免在路径过长时调用 getCanonicalPath() 导致的 IOException（改为使用 Path.resolve(...).normalize() 做语法规范化与判断）
  *
  * 注意：真正写入文件/创建目录时仍会调用文件系统操作（mkdirs、FileOutputStream），因此在非常极端的环境下仍可能遇到系统限制。
@@ -33,71 +35,54 @@ public class PackExtractor {
 
 	/**
 	 * 解压 zip 包到 destination/name 目录下。
-	 *
-	 * 主要改动点：
-	 * - 使用 destRootPath = destRoot.toPath().toAbsolutePath().normalize() 作为基准 Path。
-	 * - 用 destRootPath.resolve(...).normalize() 构建 candidate Path 并用其字符串长度判断是否超长（不调用 getCanonicalPath）。
-	 * - 使用 Path.startsWith(destRootPath) 来防止 zip-slip。
-	 * - 只有在确认路径合法、长度可接受后才实际创建父目录并写入文件。
 	 */
 	public void extractPack(Path destination, File pack, String name, LongConsumer itemCountConsumer, Runnable onItemFinished) {
-		// 根目标目录（destination/name）
 		File destRoot = destination.resolve(name).toFile();
 		try (ZipFile zip = new ZipFile(pack)) {
 			itemCountConsumer.accept(zip.size());
 
 			Enumeration<? extends ZipEntry> entries = zip.entries();
-
-			// 使用绝对规范化的 destRootPath 作为比较基准（不用 canonical 来避免对每个候选路径做文件系统调用）
 			Path destRootPath = destRoot.toPath().toAbsolutePath().normalize();
 
 			while (entries.hasMoreElements()) {
 				ZipEntry entry = entries.nextElement();
 
-				// 原始 zip 内路径（zip 里统一使用 '/' 分隔）
 				String rawEntryName = entry.getName();
 
-				// 处理并规范化 entryName：去掉前导 "./"，合并重复斜杠，去掉前导斜杠
+				// 规范化 entryName：去掉前导 "./", 前导 "/"，合并重复分隔符
 				String entryName = rawEntryName.replaceAll("^\\./+", "")
 						.replaceAll("^/+", "")
 						.replaceAll("/{2,}", "/");
 
-				// 跳过空条目（例如 zip 中可能存在空名称）
 				if (entryName == null || entryName.isEmpty()) {
 					continue;
 				}
 
-				// 判断是否为目录：entry 本身标记为目录 或 名称以 '/' 结尾，或者 zip 中存在以该名称为前缀的其它条目（说明它实际是个目录）
+				// 目录判断：entry 标记为目录、名字以 '/' 结尾、或者存在 prefix 则视为目录
 				boolean entryIsDirectory = entry.isDirectory() || rawEntryName.endsWith("/") || rawEntryName.endsWith("\\");
 
-				// 如果 zip 中没有显式目录标记，但存在以 "name/" 为前缀的其它 entry，则把当前条目当作目录（避免把 assets 写成文件）
 				if (!entryIsDirectory && zipContainsDirPrefix(zip, entryName)) {
 					entryIsDirectory = true;
 				}
 
-				// 如果是目录，则使用规范化的 Path 来创建目录并继续（避免提前 canonical）
 				if (entryIsDirectory) {
 					Path dirPath = destRootPath.resolve(entryName.replace('/', File.separatorChar)).normalize();
 					File dir = dirPath.toFile();
 					if (!dir.exists() && !dir.mkdirs()) {
 						throw new IOException("Failed to create directory: " + dir);
 					}
-					// 目录条目视为处理完成
 					onItemFinished.run();
 					continue;
 				}
 
-				// 默认使用 entryName，之后可能调整
-				String adjustedEntryName = entryName;
+				String adjustedEntryName = sanitizeEntryName(entryName);
 
-				// 先用语法上的 resolve/normalize 构造 candidate（不访问文件系统）
+				// 构建 candidate，并在过长时尝试缩短
 				Path candidateResolved = destRootPath.resolve(adjustedEntryName.replace('/', File.separatorChar)).normalize().toAbsolutePath();
 				String candidateResolvedStr = candidateResolved.toString();
 
-				// 如果语法化后的路径字符串长度超过限制，尝试用算法缩短 entryName
 				if (candidateResolvedStr.length() > MAX_PATH_LENGTH) {
-					// 调整算法现在接受 destRootPath 并基于 resolve/normalize 来判断长度（不调用 canonical）
-					String shortened = tryShortenByRemovingSingleLetterDirs(adjustedEntryName, destRootPath, MAX_PATH_LENGTH);
+					String shortened = shortenPathMoreAggressively(adjustedEntryName, destRootPath, MAX_PATH_LENGTH);
 					if (shortened == null) {
 						System.err.println("Skipped entry due to excessive path length and cannot shorten: " + entryName);
 						continue;
@@ -107,20 +92,18 @@ public class PackExtractor {
 					candidateResolvedStr = candidateResolved.toString();
 				}
 
-				// Zip Slip 检查：确保 candidateResolved 在 destRootPath 之下（或等于 destRootPath）
-				// 使用 Path.startsWith 比较规范化后的绝对路径以避免穿越
+				// Zip Slip 检查
 				if (!candidateResolved.startsWith(destRootPath)) {
 					System.err.println("Skipped entry due to zip-slip attempt: " + entryName + " -> " + adjustedEntryName);
 					continue;
 				}
 
-				// 最后确认长度（保险）
+				// 最后确认长度
 				if (candidateResolvedStr.length() > MAX_PATH_LENGTH) {
 					System.err.println("Skipped entry because adjusted path still too long: " + adjustedEntryName);
 					continue;
 				}
 
-				// 确保父目录存在（此处会实际与文件系统交互）
 				File adjustedFile = candidateResolved.toFile();
 				File parent = adjustedFile.getParentFile();
 				if (parent != null && !parent.exists()) {
@@ -129,7 +112,6 @@ public class PackExtractor {
 					}
 				}
 
-				// 写文件（使用 try-with-resources 以确保流关闭）
 				try (BufferedInputStream inputStream = new BufferedInputStream(zip.getInputStream(entry))) {
 					this.writeFile(inputStream, adjustedFile);
 				}
@@ -138,6 +120,191 @@ public class PackExtractor {
 			}
 		} catch (Exception exception) {
 			throw new RuntimeException(exception);
+		}
+	}
+
+	/**
+	 * 去掉前后/重复/空组件等，避免出现异常组件（例如 "."、".."、空组件）
+	 */
+	private String sanitizeEntryName(String entryName) {
+		String[] rawParts = entryName.split("/");
+		List<String> parts = new ArrayList<>();
+		for (int i = 0; i < rawParts.length; i++) {
+			String p = rawParts[i];
+			if (p == null || p.isEmpty()) continue;
+			if (p.equals(".") || p.equals("..")) continue;
+			parts.add(p);
+		}
+		if (parts.isEmpty()) return entryName.replaceAll("^/+", "");
+		// 确保文件名不为空（例如原始最后一部分以点开头导致 basename 为空）
+		String last = parts.get(parts.size() - 1);
+		if (last.isEmpty()) {
+			parts.set(parts.size() - 1, "file");
+		}
+		return String.join("/", parts);
+	}
+
+	/**
+	 * 更激进的缩短流程：
+	 * 1) 移除所有单字母目录
+	 * 2) 逐步截断每个组件到较短长度（从 8 到 1）
+	 * 3) 使用中间哈希（保留首尾）替换中间组件
+	 */
+	private String shortenPathMoreAggressively(String entryName, Path destRootPath, int maxLen) {
+		try {
+			// 分割并清理
+			String[] rawParts = entryName.split("/");
+			List<String> parts = new ArrayList<>();
+			for (String p : rawParts) {
+				if (p == null || p.isEmpty()) continue;
+				if (p.equals(".") || p.equals("..")) continue;
+				parts.add(p);
+			}
+			int n = parts.size();
+			if (n == 0) return null;
+			if (n == 1) {
+				// 单文件名，尝试截断文件名但保留扩展
+				String single = truncateFilename(parts.get(0), destRootPath, maxLen, null);
+				return single == null ? null : single;
+			}
+
+			// 1) 移除所有单字母目录（保留最后文件名）
+			List<String> partsNoSingles = new ArrayList<>();
+			for (int i = 0; i < n; i++) {
+				String p = parts.get(i);
+				if (i != n - 1 && p.length() == 1) {
+					continue; // 删除单字母目录
+				}
+				partsNoSingles.add(p);
+			}
+			// 若移除后长度满足直接返回
+			String candidate1 = String.join("/", partsNoSingles);
+			Path p1 = destRootPath.resolve(candidate1.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+			if (p1.toString().length() <= maxLen) {
+				System.err.println("Removed all single-letter dirs: " + entryName + " -> " + candidate1);
+				return candidate1;
+			}
+
+			// 2) 逐步截断每个组件（对于目录使用固定前缀长度，对于最后文件名保留后缀）
+			// 尝试从较长的前缀到较短前缀
+			for (int compLen = 8; compLen >= 1; compLen--) {
+				List<String> truncated = new ArrayList<>();
+				for (int i = 0; i < partsNoSingles.size(); i++) {
+					String comp = partsNoSingles.get(i);
+					if (i == partsNoSingles.size() - 1) {
+						// 文件名，保留扩展
+						truncated.add(truncateFilename(comp, destRootPath, maxLen, compLen));
+					} else {
+						truncated.add(truncateComponent(comp, compLen));
+					}
+				}
+				// 如果 truncateFilename 返回 null（表示无法在当前策略下满足），继续尝试
+				boolean anyNull = false;
+				for (String t : truncated) {
+					if (t == null) { anyNull = true; break; }
+				}
+				if (anyNull) continue;
+
+				String candidate = String.join("/", truncated);
+				Path cp = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+				if (cp.toString().length() <= maxLen) {
+					System.err.println("Truncated components to avoid long path: " + entryName + " -> " + candidate);
+					return candidate;
+				}
+			}
+
+			// 3) 使用中间哈希：保留第一个和最后一个组件，中间替换为 8 位 hex 的 hash
+			if (partsNoSingles.size() >= 2) {
+				String first = partsNoSingles.get(0);
+				String last = partsNoSingles.get(partsNoSingles.size() - 1);
+				String middleJoined = "";
+				if (partsNoSingles.size() > 2) {
+					StringBuilder sb = new StringBuilder();
+					for (int i = 1; i < partsNoSingles.size() - 1; i++) {
+						if (sb.length() > 0) sb.append("/");
+						sb.append(partsNoSingles.get(i));
+					}
+					middleJoined = sb.toString();
+				}
+				String hash = hashToHex(middleJoined);
+				String candidate = first + "/" + hash + "/" + last;
+				Path cp = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+				if (cp.toString().length() <= maxLen) {
+					System.err.println("Replaced middle with hash to avoid long path: " + entryName + " -> " + candidate);
+					return candidate;
+				}
+				// 如果还不够短，尝试缩短 first 和 last 再做 hash 方案
+				String firstShort = truncateComponent(first, 4);
+				String lastShort = truncateFilename(last, destRootPath, maxLen, 4);
+				if (firstShort != null && lastShort != null) {
+					String candidate2 = firstShort + "/" + hash + "/" + lastShort;
+					Path cp2 = destRootPath.resolve(candidate2.replace('/', File.separatorChar)).normalize().toAbsolutePath();
+					if (cp2.toString().length() <= maxLen) {
+						System.err.println("Replaced middle with hash and truncated ends: " + entryName + " -> " + candidate2);
+						return candidate2;
+					}
+				}
+			}
+
+			// 如果都失败，返回 null
+			return null;
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	/**
+	 * 截断纯目录组件到指定长度（若小于等于则原样返回）
+	 */
+	private String truncateComponent(String comp, int len) {
+		if (comp == null) return comp;
+		if (comp.length() <= len) return comp;
+		return comp.substring(0, Math.max(1, len));
+	}
+
+	/**
+	 * 截断文件名，同时保留扩展（若存在）。如果指定 compLen != null，则目录组件长度使用 compLen。
+	 * 返回截断后的文件名字符串（不会返回 null，除非输入为 null）。
+	 */
+	private String truncateFilename(String filename, Path destRootPath, int maxLen, Integer compLen) {
+		if (filename == null) return null;
+		// 找扩展名
+		int idx = filename.lastIndexOf('.');
+		String namePart = idx >= 0 ? filename.substring(0, idx) : filename;
+		String extPart = idx >= 0 ? filename.substring(idx) : "";
+
+		// 按 compLen 截断 namePart（若 compLen 为 null 则优先保留更多）
+		if (compLen != null && compLen > 0) {
+			if (namePart.length() > compLen) {
+				namePart = namePart.substring(0, Math.max(1, compLen));
+			}
+		} else {
+			// 若 compLen 为 null，尽量不截断文件名（但如果整体太长，会在外层再次尝试其他策略）
+		}
+
+		String candidate = namePart + extPart;
+		// 防止 namePart 变得只是扩展名（如 ".json" 变成 ".json"），确保 namePart 非空
+		if (namePart.isEmpty()) candidate = "file" + extPart;
+		return candidate;
+	}
+
+	/**
+	 * 把中间段哈希为 8 位 hex（SHA-1 的前 8 字节 -> 16 hex 字符，按需可改为更短）
+	 */
+	private String hashToHex(String s) {
+		try {
+			MessageDigest md = MessageDigest.getInstance("SHA-1");
+			byte[] b = md.digest(s == null ? new byte[0] : s.getBytes("UTF-8"));
+			// 取前 8 字节转为 hex（16 个 hex 字符）
+			int len = Math.min(8, b.length);
+			StringBuilder sb = new StringBuilder(len * 2);
+			for (int i = 0; i < len; i++) {
+				sb.append(String.format("%02x", b[i]));
+			}
+			return sb.toString();
+		} catch (Exception e) {
+			// 兜底，使用简单替代
+			return Integer.toHexString(s == null ? 0 : s.hashCode());
 		}
 	}
 
@@ -158,104 +325,9 @@ public class PackExtractor {
 	}
 
 	/**
-	 * 尝试通过移除 entryName 中的单字母目录（不移除最后一个组件，即文件名）来缩短路径，使得在 destRootPath 下的规范化路径长度不超过 maxLen。
-	 * 如果无法通过移除单字母目录达成，则返回 null（表示无法缩短）。
-	 *
-	 * 算法策略（更健壮的实现）：
-	 * - 将 entryName 按 '/' 分割为组件，忽略空组件。
-	 * - 收集索引为单字母的组件（不包含最后一部分）。
-	 * - 按 removableIndices 的不同组合依次移除，优先尝试从左到右移除较少数量的组件，再尝试从右向左移除一段。
-	 */
-	private String tryShortenByRemovingSingleLetterDirs(String entryName, Path destRootPath, int maxLen) {
-		try {
-			// 分割并忽略空部分
-			String[] rawParts = entryName.split("/");
-			List<String> partsList = new ArrayList<>();
-			for (String p : rawParts) {
-				if (p == null || p.isEmpty()) continue;
-				partsList.add(p);
-			}
-			int n = partsList.size();
-			if (n == 0) return null;
-
-			// 如果只有一个部分（文件名），无法缩短
-			if (n == 1) {
-				return null;
-			}
-
-			// 收集可移除的单字母部分索引（不包含最后一部分）
-			List<Integer> removableIndices = new ArrayList<>();
-			for (int i = 0; i < n - 1; i++) {
-				if (partsList.get(i).length() == 1) {
-					removableIndices.add(i);
-				}
-			}
-			if (removableIndices.isEmpty()) {
-				// 没有单字母目录可以移除
-				return null;
-			}
-
-			// 如果当前 destRoot + original entry 已经不超过 maxLen（防御性检查）
-			Path origCandidate = destRootPath.resolve(String.join(File.separator, partsList)).normalize().toAbsolutePath();
-			if (origCandidate.toString().length() <= maxLen) {
-				return entryName;
-			}
-
-			// 按 removableIndices 的顺序逐步移除 1..k 个单字母目录，检查是否达标
-			int m = removableIndices.size();
-			for (int r = 1; r <= m; r++) {
-				boolean[] removed = new boolean[n];
-				for (int i = 0; i < r; i++) {
-					removed[removableIndices.get(i)] = true;
-				}
-				// 构造新的 entryName（跳过被移除的部分）
-				StringBuilder sb = new StringBuilder();
-				for (int i = 0; i < n; i++) {
-					if (removed[i]) continue;
-					if (sb.length() > 0) sb.append('/');
-					sb.append(partsList.get(i));
-				}
-				String candidate = sb.toString();
-				Path candidatePath = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
-				if (candidatePath.toString().length() <= maxLen) {
-					System.err.println("Adjusted entry name to avoid long path: " + entryName + " -> " + candidate);
-					return candidate;
-				}
-			}
-
-			// 再尝试从右向左移除一段单字母目录（例如移除靠近文件端的若干单字母目录）
-			for (int start = m - 1; start >= 0; start--) {
-				boolean[] removed2 = new boolean[n];
-				for (int i = start; i < m; i++) {
-					removed2[removableIndices.get(i)] = true;
-				}
-				StringBuilder sb = new StringBuilder();
-				for (int i = 0; i < n; i++) {
-					if (removed2[i]) continue;
-					if (sb.length() > 0) sb.append('/');
-					sb.append(partsList.get(i));
-				}
-				String candidate = sb.toString();
-				Path candidatePath = destRootPath.resolve(candidate.replace('/', File.separatorChar)).normalize().toAbsolutePath();
-				if (candidatePath.toString().length() <= maxLen) {
-					System.err.println("Adjusted entry name to avoid long path: " + entryName + " -> " + candidate);
-					return candidate;
-				}
-			}
-
-			// 若仍然无法满足，返回 null（表示跳过该条目）
-			return null;
-		} catch (Exception e) {
-			// 在规范化过程中若有异常（尽量不要抛出），放弃缩短尝试
-			return null;
-		}
-	}
-
-	/**
 	 * 将 InputStream 写入目标文件。抛出 IOException 以便上层统一处理。
 	 */
 	public void writeFile(InputStream stream, File file) throws IOException {
-		// 使用 try-with-resources，抛出 IOException 以便上层统一处理
 		try (FileOutputStream outputStream = new FileOutputStream(file)) {
 			byte[] buffer = new byte[4096];
 			int read;
