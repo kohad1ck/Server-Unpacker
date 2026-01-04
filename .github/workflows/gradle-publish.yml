@@ -35,3 +35,12 @@ jobs:
 
     - name: Build with Gradle
       run: ./gradlew build
+      
+    - name: Upload build artifacts to Actions
+      uses: actions/upload-artifact@v4
+      with:
+        name: server-unpacker-artifacts
+        path: |
+          build/libs/**/*.jar
+          build/libs/*.jar
+          build/distributions/**/*.zip
